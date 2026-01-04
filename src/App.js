@@ -21,7 +21,7 @@ function App() {
   const [localStream, setLocalStream] = useState(null); // Stores the teacher's local screen share stream
   const participantVideoRefs = useRef({}); // Stores refs for all participant videos
   const [activeParticipants, setActiveParticipants] = useState({}); // Stores {socketId: {username, usn, isTeacher, stream}}
-
+  const [sendAsAnonymous, setSendAsAnonymous] = useState(false);
   // Chat state
   const [showChat, setShowChat] = useState(false);
   const [messages, setMessages] = useState([]);
@@ -441,8 +441,11 @@ function App() {
     }
   };
 
-  const sendMessage = (isPrivate = false, targetId = null) => {
-    if (chatInput.trim() && sessionId && loggedInUser) {
+  const sendMessage = (isPrivate = false, targetId = null , isAnonymous = false) => {
+    if(chatInput.trim() && sessionId && loggedInUser && isAnonymous){
+      socket.emit('send-message', { sessionId, message: chatInput, senderId: socket.id, isPrivate, targetId, senderName: 'Anonymous' });
+      setChatInput('');
+    }else if (chatInput.trim() && sessionId && loggedInUser) {
       socket.emit('send-message', { sessionId, message: chatInput, senderId: socket.id, isPrivate, targetId, senderName: loggedInUser.username });
       setChatInput('');
     } else {
@@ -462,7 +465,7 @@ function App() {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `attendance_session_${sessionId}.json`;
+        a.download = `attendance_session_${sessionId}.csv`;
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -728,18 +731,43 @@ function App() {
             )}
           </div>
           <div className="p-4 border-t">
-            <input
-              type="text"
-              placeholder="Type your message..."
-              className="w-full px-4 py-2 border rounded-md mb-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyPress={(e) => { if (e.key === 'Enter') sendMessage(); } }
-            />
-            <div className="flex space-x-2">
-              <button onClick={() => sendMessage()} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md">Send Public</button>
-              {/* TODO: Add dropdown to select private recipient */}
-              <button onClick={() => alert('Private chat coming soon!')} className="flex-1 bg-gray-400 text-white font-bold py-2 px-4 rounded-md cursor-not-allowed">Send Private</button>
+            {/* Anonymous checkbox */}
+            <label className="flex items-center space-x-2 cursor-pointer text-sm text-gray-700 mb-2">
+              <input
+                type="checkbox"
+                checked={sendAsAnonymous}
+                onChange={(e) => setSendAsAnonymous(e.target.checked)}
+                className="w-4 h-4"
+              />
+              <span>Send as Anonymous</span>
+            </label>
+            {/* Input + Send button */}
+            <div className="flex space-x-2 mb-2">
+              <input
+                type="text"
+                placeholder="Type your message..."
+                className="flex-1 px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === 'Enter') {
+                    sendAsAnonymous
+                      ? sendMessage(false, null, true)
+                      : sendMessage();
+                  }
+                }}
+              />
+
+              <button
+                onClick={() =>
+                  sendAsAnonymous
+                    ? sendMessage(false, null, true)
+                    : sendMessage()
+                }
+                className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 rounded-md"
+              >
+                Send
+              </button>
             </div>
           </div>
         </div>
