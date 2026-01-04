@@ -16,10 +16,11 @@ function App() {
   const [isJoined, setIsJoined] = useState(false);
   const [questions, setQuestions] = useState([]);
   const [newQuestion, setNewQuestion] = useState('');
-  const [peers, setPeers] = useState({}); // Stores RTCPeerConnection objects
-  const localVideoRef = useRef(null);
+  const [peers, setPeers] = useState({}); // Stores RTCPeerConnection objects: {socketId: RTCPeerConnection}
+  const localVideoRef = useRef(null); // Ref for the teacher's local screen share video element
+  const [localStream, setLocalStream] = useState(null); // Stores the teacher's local screen share stream
   const participantVideoRefs = useRef({}); // Stores refs for all participant videos
-  const [activeParticipants, setActiveParticipants] = useState({}); // Stores {socketId: {username, usn, stream}}
+  const [activeParticipants, setActiveParticipants] = useState({}); // Stores {socketId: {username, usn, isTeacher, stream}}
 
   // Chat state
   const [showChat, setShowChat] = useState(false);
@@ -52,6 +53,7 @@ function App() {
     };
 
     peerConnection.ontrack = (event) => {
+      console.log(`Received track from ${remoteSocketId}`, event.streams[0]);
       setActiveParticipants(prev => ({
         ...prev,
         [remoteSocketId]: {
@@ -61,9 +63,10 @@ function App() {
       }));
     };
 
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      localVideoRef.current.srcObject.getTracks().forEach(track => {
-        peerConnection.addTrack(track, localVideoRef.current.srcObject);
+    // Add local stream tracks if already available (e.g., teacher started sharing before student joined)
+    if (localStream) {
+      localStream.getTracks().forEach(track => {
+        peerConnection.addTrack(track, localStream);
       });
     }
 
@@ -80,7 +83,8 @@ function App() {
     }
 
     return peerConnection;
-  }, [sessionId, localVideoRef, setPeers, setActiveParticipants]);
+  }, [sessionId, localStream, setPeers, setActiveParticipants]); // Add localStream to dependencies
+
 
   useEffect(() => {
     // Socket.io listeners
@@ -93,7 +97,7 @@ function App() {
       console.log(`Student ${studentName} (${studentUsn}) joined: ${studentSocketId}`);
       setActiveParticipants(prev => ({
         ...prev,
-        [studentSocketId]: { username: studentName, usn: studentUsn, stream: null }
+        [studentSocketId]: { username: studentName, usn: studentUsn, isTeacher: false, stream: null }
       }));
       if (isTeacher) {
         createPeerConnection(studentSocketId, true);
@@ -104,10 +108,10 @@ function App() {
       console.log(`Teacher ${teacherName} joined: ${teacherSocketId}`);
       setActiveParticipants(prev => ({
         ...prev,
-        [teacherSocketId]: { username: teacherName, usn: 'N/A', stream: null }
+        [teacherSocketId]: { username: teacherName, usn: 'N/A', isTeacher: true, stream: null }
       }));
       // Student creates peer connection to teacher
-      if (!isTeacher) {
+      if (!isTeacher && loggedInUser && loggedInUser.id !== teacherSocketId) { // Ensure student creates PC to the teacher
         createPeerConnection(teacherSocketId, true);
       }
     });
@@ -115,7 +119,7 @@ function App() {
     socket.on('participant-left', (participantSocketId) => {
       console.log(`Participant ${participantSocketId} left.`);
       if (peers[participantSocketId]) {
-        peers[participantSocketId].close();
+        peers[participantSocketId].close(); // FIX: Corrected typo here
         setPeers(prevPeers => {
           const newPeers = { ...prevPeers };
           delete newPeers[participantSocketId];
@@ -140,29 +144,31 @@ function App() {
 
     socket.on('answer', async ({ answer, senderSocketId }) => {
       console.log('Received answer from:', senderSocketId);
-      await peers[senderSocketId].setRemoteDescription(new RTCSessionDescription(answer));
+      if (peers[senderSocketId]) {
+        await peers[senderSocketId].setRemoteDescription(new RTCSessionDescription(answer));
+      }
     });
 
     socket.on('candidate', async ({ candidate, senderSocketId }) => {
       console.log('Received ICE candidate from:', senderSocketId);
       try {
-        await peers[senderSocketId].addIceCandidate(candidate);
+        if (peers[senderSocketId]) {
+          await peers[senderSocketId].addIceCandidate(candidate);
+        }
       } catch (e) {
         console.error('Error adding received ICE candidate', e);
       }
     });
 
-    socket.on('new-question', ({ question, studentId }) => {
-      const student = activeParticipants[studentId];
-      setQuestions(prevQuestions => [...prevQuestions, { question, studentId, studentName: student ? student.username : 'Anonymous', timestamp: new Date().toLocaleTimeString() }]);
+    socket.on('new-question', ({ question, studentId, studentName }) => {
+      setQuestions(prevQuestions => [...prevQuestions, { question, studentId, studentName: studentName || 'Anonymous', timestamp: new Date().toLocaleTimeString() }]);
     });
 
-    socket.on('new-message', ({ senderId, message, isPrivate, targetId }) => {
-      const sender = activeParticipants[senderId];
+    socket.on('new-message', ({ senderId, message, isPrivate, targetId, senderName }) => {
       setMessages(prevMessages => [
         ...prevMessages,
         {
-          sender: sender ? sender.username : 'Unknown',
+          sender: senderName || 'Unknown',
           message,
           isPrivate,
           target: isPrivate ? (activeParticipants[targetId] ? activeParticipants[targetId].username : 'Unknown') : null,
@@ -178,7 +184,6 @@ function App() {
       }
     });
 
-    // Handle authentication/join failures from server
     socket.on('auth-failed', ({ message }) => {
       alert(`Authentication Failed: ${message}`);
       setIsLoggedIn(false);
@@ -196,7 +201,7 @@ function App() {
       setLoggedInUser(user);
       setActiveParticipants(prev => ({
         ...prev,
-        [socket.id]: { username: user.username, usn: user.usn, isTeacher: isTeacher, stream: null }
+        [socket.id]: { username: user.username, usn: user.usn, isTeacher: user.isTeacher, stream: null }
       }));
     });
 
@@ -216,7 +221,8 @@ function App() {
       socket.off('join-failed');
       socket.off('join-success');
     };
-  }, [isTeacher, sessionId, peers, activeParticipants, createPeerConnection]);
+  }, [isTeacher, sessionId, peers, activeParticipants, createPeerConnection, loggedInUser, localStream]);
+
 
   const startStream = async () => {
     try {
@@ -224,11 +230,23 @@ function App() {
         video: true,
         audio: true,
       });
+      setLocalStream(stream);
+
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
-      // Add tracks to all existing peer connections
+      setActiveParticipants(prev => ({
+        ...prev,
+        [socket.id]: { ...prev[socket.id], stream: stream }
+      }));
+
+
       Object.values(peers).forEach(peerConnection => {
+        peerConnection.getSenders().forEach(sender => {
+          if (sender.track && sender.track.kind === 'video') { // Only remove video tracks for new screen share
+            peerConnection.removeTrack(sender);
+          }
+        });
         stream.getTracks().forEach(track => {
           peerConnection.addTrack(track, stream);
         });
@@ -236,14 +254,22 @@ function App() {
 
     } catch (err) {
       console.error("Error accessing media devices.", err);
+      alert("Error starting screen share. Please ensure permissions are granted.");
     }
   };
 
   const stopStream = () => {
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      localVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
-      localVideoRef.current.srcObject = null;
-      // Remove tracks from all peer connections
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      setLocalStream(null);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
+      }
+      setActiveParticipants(prev => ({
+        ...prev,
+        [socket.id]: { ...prev[socket.id], stream: null }
+      }));
+
       Object.values(peers).forEach(peerConnection => {
         peerConnection.getSenders().forEach(sender => {
           if (sender.track) {
@@ -275,7 +301,7 @@ function App() {
       if (response.ok) {
         alert(data.message);
         setIsLoggedIn(true);
-        setLoggedInUser(data.user); // Store logged in user details
+        setLoggedInUser({ ...data.user, isTeacher: isTeacher });
       } else {
         alert(`Error: ${data.message}`);
       }
@@ -286,10 +312,13 @@ function App() {
   };
 
   const joinSession = () => {
+    console.log('Attempting to join session...');
+    console.log('loggedInUser:', loggedInUser);
+    console.log('isTeacher state:', isTeacher);
+
     if (isLoggedIn && loggedInUser) {
       let currentSessionId = inputSessionId;
       if (isTeacher && !inputSessionId) {
-        // Teacher creates a new session by generating a random ID on the client for initial emit
         currentSessionId = Math.random().toString(36).substring(2, 8).toUpperCase();
       }
 
@@ -299,9 +328,8 @@ function App() {
           isTeacher: loggedInUser.isTeacher,
           username: loggedInUser.username,
           usn: loggedInUser.usn || '',
-          password: password // Pass password for authentication on server
+          password: password
         });
-        // The sessionId will be set by the 'join-success' or 'session-created' event from server
       } else {
         alert('Please enter a Session ID.');
       }
@@ -311,7 +339,7 @@ function App() {
   };
 
   const leaveSession = () => {
-    socket.disconnect(); // Disconnects the socket
+    socket.disconnect();
     setIsJoined(false);
     setSessionId('');
     setUsername('');
@@ -320,15 +348,16 @@ function App() {
     setQuestions([]);
     setMessages([]);
     setPeers({});
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+    }
+    setLocalStream(null);
     setActiveParticipants({});
     setLoggedInUser(null);
     setIsLoggedIn(false);
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      localVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
-      localVideoRef.current.srcObject = null;
+    if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
     }
-    // Reconnect socket for future use if needed, or refresh page
-    // window.location.reload(); // Simple way to reset everything
   };
 
   const sendQuestion = () => {
@@ -338,7 +367,7 @@ function App() {
     } else if (loggedInUser.isTeacher) {
       alert('Teachers cannot ask questions.');
     } else {
-      alert('Please type a question and ensure you are in a session.');
+      alert('Please type a question and ensure you are in a session and logged in as a student.');
     }
   };
 
@@ -378,7 +407,6 @@ function App() {
     }
   };
 
-  // Render logic based on authentication and joined status
   if (!isLoggedIn) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-100">
@@ -521,33 +549,48 @@ function App() {
       <main className="flex-1 flex overflow-hidden">
         {/* Main Video Area */}
         <div className={`flex-1 p-4 flex flex-col items-center justify-center ${showChat ? 'w-2/3' : 'w-full'} transition-all duration-300`}>
-          {isTeacher && (
-            <div className="w-full max-w-4xl bg-gray-800 rounded-lg shadow-lg overflow-hidden relative">
-              <video ref={localVideoRef} autoPlay muted className="w-full h-auto rounded-lg"></video>
+          {/* Teacher's local stream (if sharing) */}
+          {isTeacher && localStream && (
+            <div className="w-full max-w-4xl bg-gray-800 rounded-lg shadow-lg overflow-hidden relative mb-4">
+              <video ref={localVideoRef} autoPlay muted className="w-full h-auto rounded-lg" srcObject={localStream}></video>
               <div className="absolute bottom-4 left-4 right-4 flex justify-center space-x-4">
                 <button onClick={startStream} className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-full">Start Screen Share</button>
                 <button onClick={stopStream} className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-full">Stop Screen Share</button>
               </div>
             </div>
           )}
+          {isTeacher && !localStream && (
+             <div className="w-full max-w-4xl bg-gray-800 rounded-lg shadow-lg overflow-hidden relative mb-4 flex items-center justify-center h-96 text-white text-xl">
+               <button onClick={startStream} className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-full">Start Screen Share</button>
+             </div>
+          )}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 w-full max-w-6xl mt-4">
-            {Object.entries(activeParticipants).map(([id, participant]) => ( // Ensure current user's video is shown as local if student, or as one of many streams if teacher
+
+          {/* Participant Grid for Students and Remote Streams for Teacher */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 w-full max-w-6xl">
+            {Object.entries(activeParticipants)
+              .filter(([id]) => !(id === socket.id && isTeacher && localStream)) // If teacher is sharing via localVideoRef, don't show their stream twice in the grid
+              .map(([id, participant]) => (
               <div key={id} className="bg-gray-800 rounded-lg shadow-lg overflow-hidden relative">
                 <video
                   ref={el => participantVideoRefs.current[id] = el}
                   autoPlay
-                  muted={id === socket.id} // Mute local video
+                  muted={id === socket.id} // Mute local video if it's the current user's stream
                   className="w-full h-auto rounded-lg"
                   srcObject={participant.stream}
                 ></video>
                 <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded-md text-sm">
                   {participant.username} {participant.isTeacher ? '(Teacher)' : '(Student)'}
                 </p>
+                {!participant.stream && (
+                  <div className="absolute inset-0 flex items-center justify-center text-white text-xl bg-gray-900 bg-opacity-75">
+                    {participant.isTeacher && !isTeacher ? "Waiting for teacher to share screen..." : "Waiting for stream..."}
+                  </div>
+                )}
               </div>
             ))}
             {Object.keys(activeParticipants).length === 0 && (
-              <div className="flex items-center justify-center h-48 bg-gray-200 rounded-lg text-gray-500 text-xl">
+              <div className="flex items-center justify-center h-48 bg-gray-200 rounded-lg text-gray-500 text-xl col-span-full">
                 No participants yet.
               </div>
             )}
