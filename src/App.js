@@ -1,20 +1,86 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import io from 'socket.io-client';
-import './App.css';
 
 const SERVER_URL = 'http://localhost:5000'; // Backend server URL
 const socket = io(SERVER_URL);
 
 function App() {
   const [isTeacher, setIsTeacher] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [usn, setUsn] = useState(''); // Unique Student Number
   const [sessionId, setSessionId] = useState('');
   const [inputSessionId, setInputSessionId] = useState('');
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loggedInUser, setLoggedInUser] = useState(null); // { id, username, usn, isTeacher }
   const [isJoined, setIsJoined] = useState(false);
   const [questions, setQuestions] = useState([]);
   const [newQuestion, setNewQuestion] = useState('');
   const [peers, setPeers] = useState({}); // Stores RTCPeerConnection objects
   const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
+  const participantVideoRefs = useRef({}); // Stores refs for all participant videos
+  const [activeParticipants, setActiveParticipants] = useState({}); // Stores {socketId: {username, usn, stream}}
+
+  // Chat state
+  const [showChat, setShowChat] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const chatBoxRef = useRef(null);
+
+  // Scroll to bottom of chat box
+  useEffect(() => {
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
+  }, [messages, showChat]);
+
+
+  const createPeerConnection = useCallback((remoteSocketId, isInitiator) => {
+    const peerConnection = new RTCPeerConnection({
+      // ⚠️ DEMO / PLACEHOLDER: STUN server URL. Replace if needed.
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' }
+      ]
+    });
+
+    setPeers(prevPeers => ({ ...prevPeers, [remoteSocketId]: peerConnection }));
+
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('candidate', { candidate: event.candidate, targetSocketId: remoteSocketId, sessionId });
+      }
+    };
+
+    peerConnection.ontrack = (event) => {
+      setActiveParticipants(prev => ({
+        ...prev,
+        [remoteSocketId]: {
+          ...prev[remoteSocketId],
+          stream: event.streams[0]
+        }
+      }));
+    };
+
+    if (localVideoRef.current && localVideoRef.current.srcObject) {
+      localVideoRef.current.srcObject.getTracks().forEach(track => {
+        peerConnection.addTrack(track, localVideoRef.current.srcObject);
+      });
+    }
+
+    if (isInitiator) {
+      peerConnection.onnegotiationneeded = async () => {
+        try {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
+        } catch (e) {
+          console.error('Error creating offer', e);
+        }
+      };
+    }
+
+    return peerConnection;
+  }, [sessionId, localVideoRef, setPeers, setActiveParticipants]);
 
   useEffect(() => {
     // Socket.io listeners
@@ -23,25 +89,44 @@ function App() {
       alert(`Session created with ID: ${id}`);
     });
 
-    socket.on('student-joined', (studentSocketId) => {
-      console.log(`Student ${studentSocketId} joined.`);
-      // For WebRTC: Teacher initiates offer to new student
+    socket.on('student-joined', ({ studentSocketId, studentName, studentUsn }) => {
+      console.log(`Student ${studentName} (${studentUsn}) joined: ${studentSocketId}`);
+      setActiveParticipants(prev => ({
+        ...prev,
+        [studentSocketId]: { username: studentName, usn: studentUsn, stream: null }
+      }));
       if (isTeacher) {
         createPeerConnection(studentSocketId, true);
       }
     });
 
-    socket.on('student-left', (studentSocketId) => {
-      console.log(`Student ${studentSocketId} left.`);
-      // Close peer connection if student leaves
-      if (peers[studentSocketId]) {
-        peers[studentSocketId].close();
+    socket.on('teacher-joined', ({ teacherSocketId, teacherName }) => {
+      console.log(`Teacher ${teacherName} joined: ${teacherSocketId}`);
+      setActiveParticipants(prev => ({
+        ...prev,
+        [teacherSocketId]: { username: teacherName, usn: 'N/A', stream: null }
+      }));
+      // Student creates peer connection to teacher
+      if (!isTeacher) {
+        createPeerConnection(teacherSocketId, true);
+      }
+    });
+
+    socket.on('participant-left', (participantSocketId) => {
+      console.log(`Participant ${participantSocketId} left.`);
+      if (peers[participantSocketId]) {
+        peers[participantSocketId].close();
         setPeers(prevPeers => {
           const newPeers = { ...prevPeers };
-          delete newPeers[studentSocketId];
+          delete newPeers[participantSocketId];
           return newPeers;
         });
       }
+      setActiveParticipants(prev => {
+        const newParticipants = { ...prev };
+        delete newParticipants[participantSocketId];
+        return newParticipants;
+      });
     });
 
     socket.on('offer', async ({ offer, senderSocketId }) => {
@@ -68,7 +153,22 @@ function App() {
     });
 
     socket.on('new-question', ({ question, studentId }) => {
-      setQuestions(prevQuestions => [...prevQuestions, { question, studentId, timestamp: new Date().toLocaleTimeString() }]);
+      const student = activeParticipants[studentId];
+      setQuestions(prevQuestions => [...prevQuestions, { question, studentId, studentName: student ? student.username : 'Anonymous', timestamp: new Date().toLocaleTimeString() }]);
+    });
+
+    socket.on('new-message', ({ senderId, message, isPrivate, targetId }) => {
+      const sender = activeParticipants[senderId];
+      setMessages(prevMessages => [
+        ...prevMessages,
+        {
+          sender: sender ? sender.username : 'Unknown',
+          message,
+          isPrivate,
+          target: isPrivate ? (activeParticipants[targetId] ? activeParticipants[targetId].username : 'Unknown') : null,
+          timestamp: new Date().toLocaleTimeString()
+        }
+      ]);
     });
 
     socket.on('session-ended', (id) => {
@@ -78,66 +178,45 @@ function App() {
       }
     });
 
+    // Handle authentication/join failures from server
+    socket.on('auth-failed', ({ message }) => {
+      alert(`Authentication Failed: ${message}`);
+      setIsLoggedIn(false);
+      setLoggedInUser(null);
+    });
+
+    socket.on('join-failed', ({ message }) => {
+      alert(`Join Session Failed: ${message}`);
+      setIsJoined(false);
+    });
+
+    socket.on('join-success', ({ sessionId: receivedSessionId, user }) => {
+      setSessionId(receivedSessionId);
+      setIsJoined(true);
+      setLoggedInUser(user);
+      setActiveParticipants(prev => ({
+        ...prev,
+        [socket.id]: { username: user.username, usn: user.usn, isTeacher: isTeacher, stream: null }
+      }));
+    });
+
+
     return () => {
       socket.off('session-created');
       socket.off('student-joined');
-      socket.off('student-left');
+      socket.off('teacher-joined');
+      socket.off('participant-left');
       socket.off('offer');
       socket.off('answer');
       socket.off('candidate');
       socket.off('new-question');
+      socket.off('new-message');
       socket.off('session-ended');
+      socket.off('auth-failed');
+      socket.off('join-failed');
+      socket.off('join-success');
     };
-  }, [isTeacher, sessionId, peers]);
-
-  // WebRTC setup
-  const createPeerConnection = (remoteSocketId, isInitiator) => {
-    const peerConnection = new RTCPeerConnection({
-      // This is a placeholder for STUN/TURN servers. For LAN-only, 
-      // it might work without, but for more complex network topologies,
-      // a locally hosted STUN server or TURN server might be needed.
-      // For this project, we assume a simple LAN where direct peer connection is possible.
-      // If you need STUN/TURN for your LAN setup, you would add it here.
-      // ⚠️ DEMO / PLACEHOLDER: STUN server URL. Replace if needed.
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' } 
-      ]
-    });
-
-    setPeers(prevPeers => ({ ...prevPeers, [remoteSocketId]: peerConnection }));
-
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit('candidate', { candidate: event.candidate, targetSocketId: remoteSocketId, sessionId });
-      }
-    };
-
-    peerConnection.ontrack = (event) => {
-      if (remoteVideoRef.current && event.streams[0]) {
-        remoteVideoRef.current.srcObject = event.streams[0];
-      }
-    };
-
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      localVideoRef.current.srcObject.getTracks().forEach(track => {
-        peerConnection.addTrack(track, localVideoRef.current.srcObject);
-      });
-    }
-
-    if (isInitiator) {
-      peerConnection.onnegotiationneeded = async () => {
-        try {
-          const offer = await peerConnection.createOffer();
-          await peerConnection.setLocalDescription(offer);
-          socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
-        } catch (e) {
-          console.error('Error creating offer', e);
-        }
-      };
-    }
-
-    return peerConnection;
-  };
+  }, [isTeacher, sessionId, peers, activeParticipants, createPeerConnection]);
 
   const startStream = async () => {
     try {
@@ -175,17 +254,59 @@ function App() {
     }
   };
 
+  const handleAuth = async (type) => {
+    const endpoint = isTeacher
+      ? (type === 'signup' ? '/signup-teacher' : '/login-teacher')
+      : (type === 'signup' ? '/signup-student' : '/login-student');
+
+    const body = isTeacher
+      ? { username, password }
+      : { username, usn, password };
+
+    try {
+      const response = await fetch(`${SERVER_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        alert(data.message);
+        setIsLoggedIn(true);
+        setLoggedInUser(data.user); // Store logged in user details
+      } else {
+        alert(`Error: ${data.message}`);
+      }
+    } catch (error) {
+      console.error(`Error during ${type} for ${isTeacher ? 'teacher' : 'student'}:`, error);
+      alert(`Network error during ${type}.`);
+    }
+  };
+
   const joinSession = () => {
-    if (inputSessionId) {
-      socket.emit('join-session', { sessionId: inputSessionId, isTeacher });
-      setSessionId(inputSessionId);
-      setIsJoined(true);
-    } else if (isTeacher) {
-      // Teacher creates a new session by joining a random ID
-      const newId = Math.random().toString(36).substring(2, 8).toUpperCase();
-      socket.emit('join-session', { sessionId: newId, isTeacher });
-      setSessionId(newId);
-      setIsJoined(true);
+    if (isLoggedIn && loggedInUser) {
+      let currentSessionId = inputSessionId;
+      if (isTeacher && !inputSessionId) {
+        // Teacher creates a new session by generating a random ID on the client for initial emit
+        currentSessionId = Math.random().toString(36).substring(2, 8).toUpperCase();
+      }
+
+      if (currentSessionId) {
+        socket.emit('join-session', {
+          sessionId: currentSessionId,
+          isTeacher: loggedInUser.isTeacher,
+          username: loggedInUser.username,
+          usn: loggedInUser.usn || '',
+          password: password // Pass password for authentication on server
+        });
+        // The sessionId will be set by the 'join-success' or 'session-created' event from server
+      } else {
+        alert('Please enter a Session ID.');
+      }
+    } else {
+      alert('Please log in or sign up first.');
     }
   };
 
@@ -193,110 +314,317 @@ function App() {
     socket.disconnect(); // Disconnects the socket
     setIsJoined(false);
     setSessionId('');
+    setUsername('');
+    setPassword('');
+    setUsn('');
     setQuestions([]);
+    setMessages([]);
     setPeers({});
+    setActiveParticipants({});
+    setLoggedInUser(null);
+    setIsLoggedIn(false);
     if (localVideoRef.current && localVideoRef.current.srcObject) {
       localVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
       localVideoRef.current.srcObject = null;
-    }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
     }
     // Reconnect socket for future use if needed, or refresh page
     // window.location.reload(); // Simple way to reset everything
   };
 
   const sendQuestion = () => {
-    if (newQuestion.trim() && sessionId) {
+    if (newQuestion.trim() && sessionId && loggedInUser && !loggedInUser.isTeacher) {
       socket.emit('send-question', { sessionId, question: newQuestion, studentId: socket.id });
       setNewQuestion('');
+    } else if (loggedInUser.isTeacher) {
+      alert('Teachers cannot ask questions.');
+    } else {
+      alert('Please type a question and ensure you are in a session.');
     }
   };
 
-  if (!isJoined) {
+  const sendMessage = (isPrivate = false, targetId = null) => {
+    if (chatInput.trim() && sessionId && loggedInUser) {
+      socket.emit('send-message', { sessionId, message: chatInput, senderId: socket.id, isPrivate, targetId, senderName: loggedInUser.username });
+      setChatInput('');
+    } else {
+      alert('Please type a message and ensure you are in a session.');
+    }
+  };
+
+  const downloadAttendance = async () => {
+    if (!sessionId) {
+      alert('Please join a session first to download attendance.');
+      return;
+    }
+    try {
+      const response = await fetch(`${SERVER_URL}/download-attendance/${sessionId}`);
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `attendance_session_${sessionId}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } else {
+        const errorData = await response.json();
+        alert(`Failed to download attendance: ${errorData.message}`);
+      }
+    } catch (error) {
+      console.error('Error downloading attendance:', error);
+      alert('Error downloading attendance due to network issues.');
+    }
+  };
+
+  // Render logic based on authentication and joined status
+  if (!isLoggedIn) {
     return (
-      <div className="App">
-        <h1>Join Classroom</h1>
-        <div>
-          <label>
-            <input
-              type="radio"
-              value="teacher"
-              checked={isTeacher}
-              onChange={() => setIsTeacher(true)}
-            />
-            Teacher
-          </label>
-          <label>
-            <input
-              type="radio"
-              value="student"
-              checked={!isTeacher}
-              onChange={() => setIsTeacher(false)}
-            />
-            Student
-          </label>
-        </div>
-        {!isTeacher && (
-          <div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-100">
+        <div className="bg-white p-8 rounded-lg shadow-md w-96">
+          <h1 className="text-3xl font-bold mb-6 text-center text-gray-800">{isTeacher ? 'Teacher' : 'Student'} Login / Signup</h1>
+          <div className="mb-4 flex justify-center space-x-4">
+            <label className="inline-flex items-center">
+              <input
+                type="radio"
+                className="form-radio text-blue-600"
+                value="teacher"
+                checked={isTeacher}
+                onChange={() => setIsTeacher(true)}
+              />
+              <span className="ml-2 text-gray-700">Teacher</span>
+            </label>
+            <label className="inline-flex items-center">
+              <input
+                type="radio"
+                className="form-radio text-blue-600"
+                value="student"
+                checked={!isTeacher}
+                onChange={() => setIsTeacher(false)}
+              />
+              <span className="ml-2 text-gray-700">Student</span>
+            </label>
+          </div>
+          <div className="mb-4">
             <input
               type="text"
-              placeholder="Enter Session ID"
-              value={inputSessionId}
-              onChange={(e) => setInputSessionId(e.target.value)}
+              placeholder="Enter Your Name" // For teacher username, student username
+              className="w-full px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
             />
           </div>
-        )}
-        <button onClick={joinSession}>
-          {isTeacher ? 'Start New Session' : 'Join Session'}
-        </button>
+          {!isTeacher && (
+            <div className="mb-4">
+              <input
+                type="text"
+                placeholder="Enter Your USN (Unique Student Number)"
+                className="w-full px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                value={usn}
+                onChange={(e) => setUsn(e.target.value)}
+              />
+            </div>
+          )}
+          <div className="mb-6">
+            <input
+              type="password"
+              placeholder="Enter Password"
+              className="w-full px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div className="flex space-x-4">
+            <button
+              onClick={() => handleAuth('signup')}
+              className="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50"
+            >
+              Sign Up
+            </button>
+            <button
+              onClick={() => handleAuth('login')}
+              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
+            >
+              Log In
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isJoined) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-100">
+        <div className="bg-white p-8 rounded-lg shadow-md w-96">
+          <h1 className="text-3xl font-bold mb-6 text-center text-gray-800">Join Session</h1>
+          <p className="text-center text-gray-600 mb-4">Logged in as: <span className="font-semibold">{loggedInUser?.username} ({isTeacher ? 'Teacher' : loggedInUser?.usn})</span></p>
+          {!isTeacher && (
+            <div className="mb-6">
+              <input
+                type="text"
+                placeholder="Enter Session ID"
+                className="w-full px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                value={inputSessionId}
+                onChange={(e) => setInputSessionId(e.target.value)}
+              />
+            </div>
+          )}
+          <button
+            onClick={joinSession}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
+          >
+            {isTeacher ? 'Start New Session' : 'Join Session'}
+          </button>
+          <button
+            onClick={leaveSession} // This acts as a logout when not in session
+            className="w-full bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-md mt-4"
+          >
+            Logout
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="App">
-      <h1>{isTeacher ? 'Teacher Session' : 'Student Session'}</h1>
-      <p>Session ID: {sessionId}</p>
-      <button onClick={leaveSession}>Leave Session</button>
+    <div className="min-h-screen bg-gray-100 flex flex-col">
+      <header className="bg-blue-600 text-white p-4 flex justify-between items-center">
+        <h1 className="text-2xl font-bold">{isTeacher ? 'Teacher Session' : 'Student Session'}</h1>
+        <div className="flex items-center space-x-4">
+          <p className="text-lg">Session ID: <span className="font-semibold">{sessionId}</span></p>
+          <p className="text-lg">User: <span className="font-semibold">{loggedInUser?.username}</span></p>
+          <button
+            onClick={leaveSession}
+            className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md"
+          >
+            Leave Session
+          </button>
+          <button
+            onClick={() => setShowChat(!showChat)}
+            className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md"
+          >
+            {showChat ? 'Hide Chat' : 'Show Chat'}
+          </button>
+          {isTeacher && (
+            <button
+              onClick={downloadAttendance}
+              className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-md"
+            >
+              Download Attendance
+            </button>
+          )}
+        </div>
+      </header>
 
-      {/* Video Streams */}
-      <div className="video-container">
-        {isTeacher && <video ref={localVideoRef} autoPlay muted className="local-video"></video>}
-        <video ref={remoteVideoRef} autoPlay className="remote-video"></video>
-      </div>
+      <main className="flex-1 flex overflow-hidden">
+        {/* Main Video Area */}
+        <div className={`flex-1 p-4 flex flex-col items-center justify-center ${showChat ? 'w-2/3' : 'w-full'} transition-all duration-300`}>
+          {isTeacher && (
+            <div className="w-full max-w-4xl bg-gray-800 rounded-lg shadow-lg overflow-hidden relative">
+              <video ref={localVideoRef} autoPlay muted className="w-full h-auto rounded-lg"></video>
+              <div className="absolute bottom-4 left-4 right-4 flex justify-center space-x-4">
+                <button onClick={startStream} className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-full">Start Screen Share</button>
+                <button onClick={stopStream} className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-full">Stop Screen Share</button>
+              </div>
+            </div>
+          )}
 
-      {isTeacher && (
-        <div className="teacher-controls">
-          <button onClick={startStream}>Start Screen Share</button>
-          <button onClick={stopStream}>Stop Screen Share</button>
-          <h2>Questions from Students:</h2>
-          <div className="questions-list">
-            {questions.length === 0 ? (
-              <p>No questions yet.</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 w-full max-w-6xl mt-4">
+            {Object.entries(activeParticipants).map(([id, participant]) => ( // Ensure current user's video is shown as local if student, or as one of many streams if teacher
+              <div key={id} className="bg-gray-800 rounded-lg shadow-lg overflow-hidden relative">
+                <video
+                  ref={el => participantVideoRefs.current[id] = el}
+                  autoPlay
+                  muted={id === socket.id} // Mute local video
+                  className="w-full h-auto rounded-lg"
+                  srcObject={participant.stream}
+                ></video>
+                <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded-md text-sm">
+                  {participant.username} {participant.isTeacher ? '(Teacher)' : '(Student)'}
+                </p>
+              </div>
+            ))}
+            {Object.keys(activeParticipants).length === 0 && (
+              <div className="flex items-center justify-center h-48 bg-gray-200 rounded-lg text-gray-500 text-xl">
+                No participants yet.
+              </div>
+            )}
+          </div>
+
+          {isTeacher && (
+            <div className="mt-8 w-full max-w-4xl">
+              <h2 className="text-2xl font-semibold mb-4 text-gray-800">Questions from Students:</h2>
+              <div className="bg-white p-4 rounded-lg shadow-md max-h-60 overflow-y-auto">
+                {questions.length === 0 ? (
+                  <p className="text-gray-600">No questions yet.</p>
+                ) : (
+                  questions.map((q, index) => (
+                    <div key={index} className="mb-2 p-2 bg-gray-50 rounded-md">
+                      <p className="text-gray-800">
+                        <strong className="text-blue-600">{q.studentName || 'Anonymous Student'}:</strong> {q.question} <em className="text-gray-500 text-sm">({q.timestamp})</em>
+                      </p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {!isTeacher && (
+            <div className="mt-8 w-full max-w-xl">
+              <h2 className="text-2xl font-semibold mb-4 text-gray-800">Ask a Question:</h2>
+              <div className="flex space-x-2">
+                <input
+                  type="text"
+                  placeholder="Type your question here"
+                  className="flex-1 px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  value={newQuestion}
+                  onChange={(e) => setNewQuestion(e.target.value)}
+                />
+                <button onClick={sendQuestion} className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md">Send Question</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Chat Popup */}
+        <div className={`fixed right-0 top-0 h-full bg-white shadow-lg z-50 transform ${showChat ? 'translate-x-0' : 'translate-x-full'} transition-transform duration-300 ease-in-out w-96 flex flex-col`}>
+          <div className="flex justify-between items-center p-4 border-b">
+            <h2 className="text-xl font-bold">Chat</h2>
+            <button onClick={() => setShowChat(false)} className="text-gray-600 hover:text-gray-900 text-2xl">&times;</button>
+          </div>
+          <div ref={chatBoxRef} className="flex-1 p-4 overflow-y-auto">
+            {messages.length === 0 ? (
+              <p className="text-gray-500">No messages yet.</p>
             ) : (
-              questions.map((q, index) => (
-                <div key={index} className="question-item">
-                  <p><strong>Anonymous Student:</strong> {q.question} <em>({q.timestamp})</em></p>
+              messages.map((msg, index) => (
+                <div key={index} className="mb-2">
+                  <span className="font-semibold">{msg.sender}{msg.isPrivate ? ` (private to ${msg.target})` : ''}: </span>
+                  <span>{msg.message}</span>
+                  <span className="text-xs text-gray-500 ml-2">{msg.timestamp}</span>
                 </div>
               ))
             )}
           </div>
+          <div className="p-4 border-t">
+            <input
+              type="text"
+              placeholder="Type your message..."
+              className="w-full px-4 py-2 border rounded-md mb-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyPress={(e) => { if (e.key === 'Enter') sendMessage(); } }
+            />
+            <div className="flex space-x-2">
+              <button onClick={() => sendMessage()} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md">Send Public</button>
+              {/* TODO: Add dropdown to select private recipient */}
+              <button onClick={() => alert('Private chat coming soon!')} className="flex-1 bg-gray-400 text-white font-bold py-2 px-4 rounded-md cursor-not-allowed">Send Private</button>
+            </div>
+          </div>
         </div>
-      )}
-
-      {!isTeacher && (
-        <div className="student-controls">
-          <h2>Ask a Question:</h2>
-          <input
-            type="text"
-            placeholder="Type your question here"
-            value={newQuestion}
-            onChange={(e) => setNewQuestion(e.target.value)}
-          />
-          <button onClick={sendQuestion}>Send Question</button>
-        </div>
-      )}
+      </main>
     </div>
   );
 }
