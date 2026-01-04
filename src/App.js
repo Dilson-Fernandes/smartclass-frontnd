@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import io from 'socket.io-client';
 
-const SERVER_URL = 'http://localhost:5000'; // Backend server URL
+const SERVER_URL = 'http://192.168.1.7:5000'; // Backend server URL
 const socket = io(SERVER_URL);
 
 function App() {
@@ -35,13 +35,23 @@ function App() {
     }
   }, [messages, showChat]);
 
+  // Sync video elements with streams when activeParticipants changes
+  useEffect(() => {
+    Object.entries(activeParticipants).forEach(([id, participant]) => {
+      const videoElement = participantVideoRefs.current[id];
+      if (videoElement && participant.stream) {
+        if (videoElement.srcObject !== participant.stream) {
+          videoElement.srcObject = participant.stream;
+        }
+      }
+    });
+  }, [activeParticipants]);
+
 
   const createPeerConnection = useCallback((remoteSocketId, isInitiator) => {
     const peerConnection = new RTCPeerConnection({
-      // ⚠️ DEMO / PLACEHOLDER: STUN server URL. Replace if needed.
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' }
-      ]
+      iceServers: [],
+      iceTransportPolicy: 'all'
     });
 
     setPeers(prevPeers => ({ ...prevPeers, [remoteSocketId]: peerConnection }));
@@ -54,14 +64,38 @@ function App() {
 
     peerConnection.ontrack = (event) => {
       console.log(`Received track from ${remoteSocketId}`, event.streams[0]);
+      const stream = event.streams[0];
       setActiveParticipants(prev => ({
         ...prev,
         [remoteSocketId]: {
           ...prev[remoteSocketId],
-          stream: event.streams[0]
+          stream: stream
         }
       }));
+      
+      // Ensure video element is updated when stream arrives
+      setTimeout(() => {
+        if (participantVideoRefs.current[remoteSocketId] && stream) {
+          participantVideoRefs.current[remoteSocketId].srcObject = stream;
+        }
+      }, 100);
     };
+
+    // Set up negotiation handler for initiators (both teacher and students can be initiators)
+    if (isInitiator) {
+      peerConnection.onnegotiationneeded = async () => {
+        try {
+          // Check if connection already has local description to avoid unnecessary negotiations
+          if (peerConnection.signalingState === 'stable' || peerConnection.signalingState === 'have-local-offer') {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
+          }
+        } catch (e) {
+          console.error('Error creating offer', e);
+        }
+      };
+    }
 
     // Add local stream tracks if already available (e.g., teacher started sharing before student joined)
     if (localStream) {
@@ -70,20 +104,8 @@ function App() {
       });
     }
 
-    if (isInitiator) {
-      peerConnection.onnegotiationneeded = async () => {
-        try {
-          const offer = await peerConnection.createOffer();
-          await peerConnection.setLocalDescription(offer);
-          socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
-        } catch (e) {
-          console.error('Error creating offer', e);
-        }
-      };
-    }
-
     return peerConnection;
-  }, [sessionId, localStream, setPeers, setActiveParticipants]); // Add localStream to dependencies
+  }, [sessionId, localStream]); // Add localStream to dependencies
 
 
   useEffect(() => {
@@ -135,11 +157,21 @@ function App() {
 
     socket.on('offer', async ({ offer, senderSocketId }) => {
       console.log('Received offer from:', senderSocketId);
-      const peer = createPeerConnection(senderSocketId, false);
-      await peer.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      socket.emit('answer', { answer, targetSocketId: senderSocketId, sessionId });
+      let peer = peers[senderSocketId];
+      
+      // Create peer connection if it doesn't exist
+      if (!peer) {
+        peer = createPeerConnection(senderSocketId, false);
+      }
+      
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        socket.emit('answer', { answer, targetSocketId: senderSocketId, sessionId });
+      } catch (e) {
+        console.error('Error handling offer', e);
+      }
     });
 
     socket.on('answer', async ({ answer, senderSocketId }) => {
@@ -240,16 +272,54 @@ function App() {
         [socket.id]: { ...prev[socket.id], stream: stream }
       }));
 
-
-      Object.values(peers).forEach(peerConnection => {
+      // Add tracks to all existing peer connections and trigger renegotiation if needed
+      Object.entries(peers).forEach(async ([remoteSocketId, peerConnection]) => {
+        // Remove existing video tracks first
         peerConnection.getSenders().forEach(sender => {
-          if (sender.track && sender.track.kind === 'video') { // Only remove video tracks for new screen share
+          if (sender.track && sender.track.kind === 'video') {
             peerConnection.removeTrack(sender);
           }
         });
+        
+        // Add new tracks
         stream.getTracks().forEach(track => {
           peerConnection.addTrack(track, stream);
         });
+        
+        // If connection already has remote description, we need to renegotiate
+        // WebRTC should fire onnegotiationneeded, but we'll also manually trigger if needed
+        if (peerConnection.remoteDescription) {
+          // Store the existing handler if any
+          const existingHandler = peerConnection.onnegotiationneeded;
+          
+          // Set up negotiation handler
+          const negotiationHandler = async () => {
+            try {
+              if (peerConnection.signalingState === 'stable' || peerConnection.signalingState === 'have-local-offer') {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
+              }
+            } catch (e) {
+              console.error('Error creating renegotiation offer', e);
+            }
+          };
+          
+          peerConnection.onnegotiationneeded = negotiationHandler;
+          
+          // Manually trigger negotiation after a short delay to ensure tracks are added
+          setTimeout(async () => {
+            try {
+              if (peerConnection.signalingState === 'stable') {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('offer', { offer: peerConnection.localDescription, targetSocketId: remoteSocketId, sessionId });
+              }
+            } catch (e) {
+              console.error('Error triggering renegotiation', e);
+            }
+          }, 200);
+        }
       });
 
     } catch (err) {
@@ -573,11 +643,17 @@ function App() {
               .map(([id, participant]) => (
               <div key={id} className="bg-gray-800 rounded-lg shadow-lg overflow-hidden relative">
                 <video
-                  ref={el => participantVideoRefs.current[id] = el}
+                  ref={el => {
+                    participantVideoRefs.current[id] = el;
+                    // Ensure video element srcObject is set when ref is assigned
+                    if (el && participant.stream) {
+                      el.srcObject = participant.stream;
+                    }
+                  }}
                   autoPlay
+                  playsInline
                   muted={id === socket.id} // Mute local video if it's the current user's stream
                   className="w-full h-auto rounded-lg"
-                  srcObject={participant.stream}
                 ></video>
                 <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded-md text-sm">
                   {participant.username} {participant.isTeacher ? '(Teacher)' : '(Student)'}
